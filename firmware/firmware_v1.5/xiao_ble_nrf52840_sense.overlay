@@ -1,11 +1,14 @@
 / {
     chosen {
-        nordic,pm-ext-flash = &p25q16h;
-        zephyr,code-partition = <&slot0_partition>;
+        zephyr,code-partition = &slot0_partition;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,uart-mcumgr = &uart0;
+		zephyr,bt-mon-uart = &uart0;
+		zephyr,bt-c2h-uart = &uart0;
     };
     aliases {
         sw0 = &button0;
-        ext-flash = &p25q16h;
     };
     buttons {
         compatible = "gpio-keys";
@@ -35,8 +38,10 @@
     };
 };
 
+/delete-node/ &boot_partition;
+/delete-node/ &storage_partition;
+
 &flash0 {
-    /delete-node/ partitions;
     partitions {
 		compatible = "fixed-partitions";
 		#address-cells = <1>;
@@ -46,6 +51,7 @@
 			label = "mcuboot";
 			reg = <0x00000000 0x00011000>;
 		};
+
 		slot0_partition: partition@11000 {
 			label = "image-0";
 			reg = <0x000011000 0x000ed000>;
