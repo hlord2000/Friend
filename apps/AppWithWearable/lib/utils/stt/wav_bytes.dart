@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:friend_private/backend/preferences.dart';
+import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/material.dart';
-import '/flutter_flow/flutter_flow_util.dart';
+import 'package:wav/wav.dart';
 
 const int sampleRate = 8000;
 const int channelCount = 1;
@@ -13,11 +15,15 @@ class WavBytesUtil {
   // List to hold audio data in bytes
   final List<int> _audioBytes = [];
 
-  get audioBytes => _audioBytes;
+  List<int> get audioBytes => _audioBytes;
 
   // Method to add audio bytes (now accepts List<int> instead of Uint8List)
   void addAudioBytes(List<int> bytes) {
     _audioBytes.addAll(bytes);
+  }
+
+  void insertAudioBytes(List<int> bytes) {
+    _audioBytes.insertAll(0, bytes);
   }
 
   // Method to clear audio bytes
@@ -26,34 +32,21 @@ class WavBytesUtil {
     debugPrint('Cleared audio bytes');
   }
 
-  void cleanAudioBytes() {
-    // Assuming empty audio bytes mean zeros
-    _audioBytes.removeWhere((byte) => byte == 0);
+  void clearAudioBytesSegment({required int remainingSeconds}) {
+    _audioBytes.removeRange(0, (_audioBytes.length) - (remainingSeconds * 8000));
   }
 
-  // Method to clean out the silent parts based on a given threshold
-  // void removeSilentSegments({int silenceThreshold = 10}) {
-  //   // Identify segments with sound (above the silenceThreshold)
-  //   List<int> cleanedBytes = [];
-  //   for (int byte in _audioBytes) {
-  //     if (byte.abs() > silenceThreshold) {
-  //       cleanedBytes.add(byte);
-  //     }
-  //   }
-  //   _audioBytes
-  //     ..clear()
-  //     ..addAll(cleanedBytes);
-  //   debugPrint('Cleaned silent segments');
-  // }
-
   // Method to create a WAV file from the stored audio bytes
-  Future<File> createWavFile() async {
-    // TODO: remove empty sounds without words
-    // removeSilentSegments();
-    final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
-    final wavHeader = buildWavHeader(_audioBytes.length * 2);
-    final wavBytes = Uint8List.fromList(wavHeader + convertToLittleEndianBytes(_audioBytes));
-    final filename = 'recording-$timestamp.wav';
+  static Future<File> createWavFile(List<int> audioBytes, {String? filename}) async {
+    debugPrint('Creating WAV file...');
+    // TODO: include VAD somewhere onnx pico-voice
+
+    if (filename == null) {
+      final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+      filename = 'recording-$timestamp.wav';
+    }
+
+    final wavBytes = getUInt8ListBytes(audioBytes);
 
     final directory = await getApplicationDocumentsDirectory();
     final file = File('${directory.path}/$filename');
@@ -62,8 +55,13 @@ class WavBytesUtil {
     return file;
   }
 
+  static Uint8List getUInt8ListBytes(List<int> audioBytes) {
+    final wavHeader = buildWavHeader(audioBytes.length * 2);
+    return Uint8List.fromList(wavHeader + convertToLittleEndianBytes(audioBytes));
+  }
+
   // Utility to convert audio data to little-endian format
-  Uint8List convertToLittleEndianBytes(List<int> audioData) {
+  static Uint8List convertToLittleEndianBytes(List<int> audioData) {
     final byteData = ByteData(2 * audioData.length);
     for (int i = 0; i < audioData.length; i++) {
       byteData.setUint16(i * 2, audioData[i], Endian.little);
@@ -71,7 +69,7 @@ class WavBytesUtil {
     return byteData.buffer.asUint8List();
   }
 
-  Uint8List buildWavHeader(int dataLength) {
+  static Uint8List buildWavHeader(int dataLength) {
     final byteData = ByteData(44);
     final size = dataLength + 36;
 

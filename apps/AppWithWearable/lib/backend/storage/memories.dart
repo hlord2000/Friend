@@ -1,27 +1,38 @@
-import 'package:friend_private/flutter_flow/flutter_flow_util.dart';
+import 'dart:convert';
+import 'dart:math';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 class Structured {
   String title;
   String overview;
   List<String> actionItems;
+  List<String> pluginsResponse;
+  String emoji = ['🚀', '🤔', '📚', '🏃‍♂️', '📞'][Random().nextInt(5)];
+  String category;
 
   Structured({
     this.title = "",
     this.overview = "",
     required this.actionItems,
+    required this.pluginsResponse,
+    this.category = '',
   });
 
   factory Structured.fromJson(Map<String, dynamic> json) => Structured(
         title: json['title'],
         overview: json['overview'],
-        actionItems: List<String>.from(json['action_items']),
+        actionItems: List<String>.from(json['action_items'] ?? []),
+        pluginsResponse: List<String>.from(json['pluginsResponse'] ?? []),
+        category: json['category'] ?? '',
       );
 
   Map<String, dynamic> toJson() => {
         'title': title,
         'overview': overview,
         'action_items': List<dynamic>.from(actionItems),
+        'pluginsResponse': List<dynamic>.from(pluginsResponse),
+        'category': category,
       };
 
   @override
@@ -35,32 +46,38 @@ class Structured {
     for (var item in actionItems) {
       str += '  - $item\n';
     }
+    if (pluginsResponse.isNotEmpty) {
+      str += 'Plugins Response:\n';
+    }
+    for (var response in pluginsResponse) {
+      str += '  - $response\n';
+    }
+    str += 'Category: $category\n';
     return str;
   }
 }
 
 class MemoryRecord {
-  String transcript;
   String id;
-
-  // String uid;
   DateTime createdAt;
+  String transcript;
+  String? recordingFilePath;
   Structured structured;
   bool discarded;
 
   MemoryRecord({
     required this.transcript,
     required this.id,
-    // required this.uid,
     required this.createdAt,
     required this.structured,
+    this.recordingFilePath,
     this.discarded = false,
   });
 
   factory MemoryRecord.fromJson(Map<String, dynamic> json) => MemoryRecord(
         transcript: json['transcript'],
         id: json['id'],
-        // uid: json['uid'],
+        recordingFilePath: json['recording_file_path'],
         createdAt: DateTime.parse(json['created_at']),
         structured: Structured.fromJson(json['structured']),
         discarded: json['discarded'] ?? false,
@@ -69,9 +86,9 @@ class MemoryRecord {
   Map<String, dynamic> toJson() => {
         'transcript': transcript,
         'id': id,
-        // 'uid': uid,
         'created_at': createdAt.toIso8601String(),
         'structured': structured.toJson(),
+        'recording_audio_path': recordingFilePath,
         'discarded': discarded,
       };
 
@@ -92,6 +109,9 @@ class MemoryRecord {
       Summary: ${e.structured.overview}
       ${e.structured.actionItems.isNotEmpty ? 'Action Items:' : ''}
       ${e.structured.actionItems.map((item) => '  - $item').join('\n')}
+      ${e.structured.pluginsResponse.isNotEmpty ? 'Plugins Response:' : ''}
+      ${e.structured.pluginsResponse.map((response) => '  - $response').join('\n')}
+      Category: ${e.structured.category}
       '''
           .replaceAll('      ', '')
           .trim())
@@ -108,11 +128,12 @@ class MemoryStorage {
     await prefs.setStringList(_storageKey, allMemories);
   }
 
-  static Future<List<MemoryRecord>> getAllMemories() async {
+  static Future<List<MemoryRecord>> getAllMemories({includeDiscarded = false}) async {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     List<String> allMemories = prefs.getStringList(_storageKey) ?? [];
     List<MemoryRecord> memories =
         allMemories.reversed.map((memory) => MemoryRecord.fromJson(jsonDecode(memory))).toList();
+    if (includeDiscarded) return memories.where((memory) => memory.transcript.split(' ').length > 10).toList();
     return memories.where((memory) => !memory.discarded).toList();
   }
 
@@ -148,10 +169,13 @@ class MemoryStorage {
         id: oldMemory.id,
         createdAt: oldMemory.createdAt,
         transcript: oldMemory.transcript,
+        recordingFilePath: oldMemory.recordingFilePath,
         structured: Structured(
           title: updatedTitle,
           overview: updatedDescription,
           actionItems: oldMemory.structured.actionItems,
+          pluginsResponse: oldMemory.structured.pluginsResponse,
+          category: oldMemory.structured.category,
         ),
         discarded: oldMemory.discarded,
       );

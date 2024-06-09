@@ -9,7 +9,7 @@ import 'package:flutter/material.dart';
 Future<void> initializeNotifications() async {
   bool initialized = await AwesomeNotifications().initialize(
       // set the icon to null if you want to use the default app icon
-      'resource://drawable/res_app_icon',
+      'resource://drawable/icon',
       [
         NotificationChannel(
             channelGroupKey: 'channel_group_key',
@@ -27,16 +27,14 @@ Future<void> initializeNotifications() async {
   debugPrint('initializeNotifications: $initialized');
 }
 
-void requestNotificationPermissions() {
-  AwesomeNotifications().isNotificationAllowed().then((isAllowed) {
-    debugPrint('requestNotificationPermissions: $isAllowed');
-    if (!isAllowed) {
-      // This is just a basic example. For real apps, you must show some
-      // friendly dialog box before call the request method.
-      // This is very important to not harm the user experience
-      AwesomeNotifications().requestPermissionToSendNotifications();
-    }
-  });
+Future<void> requestNotificationPermissions() async {
+  bool isAllowed = await AwesomeNotifications().isNotificationAllowed();
+  if (!isAllowed) {
+    // This is just a basic example. For real apps, you must show some
+    // friendly dialog box before call the request method.
+    // This is very important to not harm the user experience
+    AwesomeNotifications().requestPermissionToSendNotifications();
+  }
 }
 
 void createNotification({String title = '', String body = '', int notificationId = 1}) async {

@@ -1,27 +1,20 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:friend_private/backend/api_requests/api_calls.dart';
+import 'package:friend_private/backend/mixpanel.dart';
+import 'package:friend_private/backend/preferences.dart';
+import 'package:friend_private/backend/schema/bt_device.dart';
+import 'package:friend_private/backend/storage/segment.dart';
+import 'package:friend_private/utils/ble/communication.dart';
 import 'package:friend_private/utils/memories.dart';
 import 'package:friend_private/backend/api_requests/cloud_storage.dart';
 import 'package:friend_private/utils/notifications.dart';
 import 'package:friend_private/utils/sentry_log.dart';
-import 'package:friend_private/utils/stt/deepgram.dart';
 import 'package:friend_private/utils/stt/wav_bytes.dart';
-import 'package:google_fonts/google_fonts.dart';
-import 'package:sentry_flutter/sentry_flutter.dart';
-import 'package:tuple/tuple.dart';
-import 'package:web_socket_channel/io.dart';
-
-import '/backend/schema/structs/index.dart';
-import '/flutter_flow/flutter_flow_theme.dart';
-import '/flutter_flow/flutter_flow_util.dart';
-import 'info_button.dart';
-
-enum WebsocketConnectionStatus { notConnected, connected, failed, closed, error }
+import 'package:lottie/lottie.dart';
 
 class TranscriptWidget extends StatefulWidget {
   final Function refreshMemories;
@@ -38,239 +31,167 @@ class TranscriptWidget extends StatefulWidget {
   State<TranscriptWidget> createState() => TranscriptWidgetState();
 }
 
-class TranscriptWidgetState extends State<TranscriptWidget> with WidgetsBindingObserver {
-  WebsocketConnectionStatus wsConnectionState = WebsocketConnectionStatus.notConnected;
-  bool websocketReconnecting = false;
-  List<Map<int, String>> whispersDiarized = [{}];
+class TranscriptWidgetState extends State<TranscriptWidget> {
+  BTDeviceStruct? btDevice;
+  List<TranscriptSegment> segments = [];
 
-  IOWebSocketChannel? channel;
-  StreamSubscription? streamSubscription;
+  List<int> bucket = List.filled(40000, 0).toList(growable: true);
+  StreamSubscription? audioBytesStream;
   WavBytesUtil? audioStorage;
 
   Timer? _memoryCreationTimer;
-
-  String customWebsocketTranscript = '';
-  IOWebSocketChannel? channelCustomWebsocket;
-
   Timer? _conversationAdvisorTimer;
+  bool memoryCreating = false;
 
   @override
   void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
+    btDevice = widget.btDevice;
     SchedulerBinding.instance.addPostFrameCallback((_) async {
-      initBleConnection();
+      initiateBytesProcessing();
     });
     _initiateConversationAdvisorTimer();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    super.didChangeAppLifecycleState(state);
-    if (state == AppLifecycleState.paused) {
-      addEventToContext('App is paused');
-    } else if (state == AppLifecycleState.resumed) {
-      addEventToContext('App is resumed');
-    } else if (state == AppLifecycleState.hidden) {
-      addEventToContext('App is hidden');
-    }
+    _processCachedTranscript();
+    super.initState();
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
     _conversationAdvisorTimer?.cancel();
     _memoryCreationTimer?.cancel();
     debugPrint('TranscriptWidget disposed');
     super.dispose();
   }
 
-  updateTranscript(Map<int, Map<String, dynamic>> current) {
-    var previous = Map<int, String>.from(whispersDiarized.last);
-    List<int> currentOrdered = current.keys.toList()
-      ..sort((a, b) => current[a]!['starts'].compareTo(current[b]!['starts']));
+  _processCachedTranscript() async {
+    debugPrint('_processCachedTranscript');
+    var segments = SharedPreferencesUtil().transcriptSegments;
+    if (segments.isEmpty) return;
+    String transcript = _buildDiarizedTranscriptMessage(SharedPreferencesUtil().transcriptSegments);
+    File file = await WavBytesUtil.createWavFile(SharedPreferencesUtil().temporalAudioBytes);
+    String? fileName = await uploadFile(file);
+    processTranscriptContent(context, transcript, fileName, file.path, retrievedFromCache: true);
+    SharedPreferencesUtil().transcriptSegments = [];
+  }
 
-    if (previous.length == 1 && current.length == 1 && previous.keys.toList()[0] == current.keys.toList()[0]) {
-      // Last diarized, it's just 1, and here's just one, just add
-      int speakerIdx = current.keys.toList()[0];
-      previous[speakerIdx] = '${previous[speakerIdx]!} ' + current[current.keys.toList()[0]]!['transcript'];
-      whispersDiarized[whispersDiarized.length - 1] = previous;
-      // Same speaker, just add
-    } else if (previous.length == 1 && current.length == 2 && previous.keys.toList()[0] == currentOrdered[0]) {
-      // TODO: verify this is happening
-      // add that transcript fot the speakers, but append the remaining ones as new speakers
-      // Last diarized it's just 1, and here's 2 but the previous speaker, is one that starts first here
-      previous[currentOrdered[0]] = (previous[currentOrdered[0]] ?? '') + current[currentOrdered[0]]!['transcript'];
-      whispersDiarized[whispersDiarized.length - 1] = previous;
-      var newTranscription = <int, String>{};
-      for (var speaker in currentOrdered) {
-        if (speaker != currentOrdered[0]) newTranscription[speaker] = current[speaker]!['transcript'];
+  Future<void> initiateBytesProcessing() async {
+    if (btDevice == null) return;
+    WavBytesUtil wavBytesUtil = WavBytesUtil();
+    WavBytesUtil toProcessBytes = WavBytesUtil();
+    // VadUtil vad = VadUtil();
+    // await vad.init();
+
+    StreamSubscription? stream = await getBleAudioBytesListener(btDevice!.id, onAudioBytesReceived: (List<int> value) {
+      if (value.isEmpty) return;
+      value.removeRange(0, 3);
+      // ~ losing because of pipe precision, voltage on device is 0.912391923, it sends 1,
+      // so we are losing lots of resolution, and bit depth
+      for (int i = 0; i < value.length; i += 2) {
+        int byte1 = value[i];
+        int byte2 = value[i + 1];
+        int int16Value = (byte2 << 8) | byte1;
+        wavBytesUtil.addAudioBytes([int16Value]);
+        toProcessBytes.addAudioBytes([int16Value]);
+        if (int16Value < 3000) bucket.add(int16Value);
+        // TODO: first 2 seconds are highest points bytes sent, weird, handle that so graph doesn't look shitty
       }
-      whispersDiarized.add(newTranscription);
-    } else if (previous.isEmpty) {
-      // Different speakers, just add
-      current.forEach((speaker, data) {
-        whispersDiarized[whispersDiarized.length - 1][speaker] = data['transcript'];
-      });
-    } else {
-      // Different speakers, just add
-      whispersDiarized.add({});
-      current.forEach((speaker, data) {
-        whispersDiarized[whispersDiarized.length - 1][speaker] = data['transcript'];
-      });
+      // if (bucket.length > 40000) {
+      //   setState(() {
+      //     bucket = bucket.sublist(bucket.length - 40000);
+      //   });
+      // }
+      if (toProcessBytes.audioBytes.length % 240000 == 0) {
+        var bytesCopy = List<int>.from(toProcessBytes.audioBytes);
+        SharedPreferencesUtil().temporalAudioBytes = wavBytesUtil.audioBytes;
+        toProcessBytes.clearAudioBytesSegment(remainingSeconds: 1);
+        WavBytesUtil.createWavFile(bytesCopy, filename: 'temp.wav').then((f) async {
+          // var containsAudio = await vad.predict(f.readAsBytesSync());
+          // debugPrint('Processing audio bytes: ${f.toString()}');
+          try {
+            List<TranscriptSegment> segments = await transcribeAudioFile(f, SharedPreferencesUtil().uid);
+            processCustomTranscript(segments);
+          } catch (e) {
+            debugPrint(e.toString());
+            toProcessBytes.insertAudioBytes(bytesCopy.sublist(0, 232000)); // remove last 1 sec to avoid duplicate
+          }
+        });
+      }
+    });
+
+    audioBytesStream = stream;
+    audioStorage = wavBytesUtil;
+  }
+
+  void _cleanTranscript(List<TranscriptSegment> segments) {
+    var hallucinations = ['Thank you.', 'I don\'t know what to do,', 'I\'m'];
+    for (var i = 0; i < segments.length; i++) {
+      for (var hallucination in hallucinations) {
+        segments[i].text = segments[i]
+            .text
+            .replaceAll('$hallucination $hallucination $hallucination', '')
+            .replaceAll('$hallucination $hallucination', '')
+            .replaceAll('  ', ' ')
+            .trim();
+      }
+    }
+    // remove empty segments
+    segments.removeWhere((element) => element.text.isEmpty);
+  }
+
+  void processCustomTranscript(List<TranscriptSegment> data) {
+    if (data.isEmpty) return;
+    var joinedSimilarSegments = <TranscriptSegment>[];
+    for (var value in data) {
+      if (joinedSimilarSegments.isNotEmpty &&
+          (joinedSimilarSegments.last.speaker == value.speaker ||
+              (joinedSimilarSegments.last.isUser && value.isUser))) {
+        joinedSimilarSegments.last.text += ' ${value.text}';
+      } else {
+        joinedSimilarSegments.add(value);
+      }
     }
 
-    // iterate speakers by startTime first
+    if (segments.isNotEmpty &&
+        (segments.last.speaker == joinedSimilarSegments[0].speaker ||
+            (segments.last.isUser && joinedSimilarSegments[0].isUser))) {
+      segments.last.text += ' ${joinedSimilarSegments[0].text}';
+      joinedSimilarSegments.removeAt(0);
+    }
+
+    _cleanTranscript(segments);
+    _cleanTranscript(joinedSimilarSegments);
+
+    segments.addAll(joinedSimilarSegments);
+    SharedPreferencesUtil().transcriptSegments = segments;
     setState(() {});
+    _initiateMemoryCreationTimer();
   }
 
-  Future<void> initBleConnection() async {
-    Tuple4<IOWebSocketChannel?, StreamSubscription?, WavBytesUtil, IOWebSocketChannel?> data = await bleReceiveWAV(
-        btDevice: widget.btDevice!,
-        speechFinalCallback: (List<dynamic> words, String transcriptItem) {
-          debugPrint("Deepgram Finalized Callback received");
-          Map<int, Map<String, dynamic>> bySpeaker = {};
-          for (var word in words) {
-            // LATER: get words for speaker 0, idx 0 to 5, then next speaker 1 on 6-7, then again speaker 0, do not just append
-            debugPrint('Word: ${word.toString()}');
-            int speaker = word['speaker'];
-            if (bySpeaker[speaker] == null) bySpeaker[speaker] = <String, dynamic>{};
-            String currentSpeakerTranscript = bySpeaker[speaker]!['transcript'] ?? '';
-            bySpeaker[speaker]!['transcript'] = '${currentSpeakerTranscript + word['punctuated_word']} ';
-            bySpeaker[speaker]!['starts'] = min<double>(bySpeaker[speaker]!['starts'] ?? 999999999999.0, word['start']);
-            bySpeaker[speaker]!['ends'] = max<double>(bySpeaker[speaker]!['ends'] ?? -1, word['end']);
-          }
-          debugPrint(bySpeaker.toString());
-          updateTranscript(bySpeaker);
-          _initiateMemoryCreationTimer();
-        },
-        interimCallback: (Map<int, String> transcriptBySpeaker, String transcriptItem) {
-          // debugPrint('interimCallback called');
-          // _memoryCreationTimer?.cancel();
-          // updateTranscript(transcriptBySpeaker); // interim causes makes a bit more complex the
-        },
-        onWebsocketConnectionSuccess: () {
-          addEventToContext('Websocket Opened');
-          setState(() {
-            wsConnectionState = WebsocketConnectionStatus.connected;
-            websocketReconnecting = false;
-            _reconnectionAttempts = 0; // Reset counter on successful connection
-          });
-        },
-        onWebsocketConnectionFailed: (err) {
-          addEventToContext('Websocket Unable To Connect');
-          Sentry.captureException(err);
-          // connection couldn't be initiated for some reason.
-          setState(() {
-            wsConnectionState = WebsocketConnectionStatus.failed;
-            websocketReconnecting = false;
-          });
-          _reconnectWebSocket();
-        },
-        onWebsocketConnectionClosed: (int? closeCode, String? closeReason) {
-          // connection was closed, either on resetState, or by deepgram, or by some other reason.
-          addEventToContext('Websocket Closed');
-          Sentry.captureMessage('Websocket Closed', level: SentryLevel.warning);
-          setState(() {
-            wsConnectionState = WebsocketConnectionStatus.closed;
-          });
-          if (closeCode != 1000) {
-            // attempt to reconnect
-            _reconnectWebSocket();
-          }
-        },
-        onWebsocketConnectionError: (err) {
-          // connection was okay, but then failed.
-          addEventToContext('Websocket Error');
-          Sentry.captureException(err, stackTrace: err.stackTrace);
-          setState(() {
-            wsConnectionState = WebsocketConnectionStatus.error;
-            websocketReconnecting = false;
-          });
-          _reconnectWebSocket();
-        },
-        onCustomWebSocketCallback: (String transcript) async {
-          // debugPrint('Custom Websocket Callback: $transcript');
-          for (var word in transcript.split(' ')) {
-            setState(() {
-              customWebsocketTranscript += '$word ';
-            });
-            await Future.delayed(const Duration(milliseconds: 100));
-          }
-          setState(() {
-            customWebsocketTranscript += '\n';
-          });
-        });
-
-    channel = data.item1;
-    streamSubscription = data.item2;
-    audioStorage = data.item3;
-    channelCustomWebsocket = data.item4;
-  }
-
-  void resetState({bool resetBLEConnection = true}) {
-    streamSubscription?.cancel();
-    channel?.sink.close(1000); // when closed from here, don't try to reconnect
-    channelCustomWebsocket?.sink.close(1000);
+  void resetState({bool restartBytesProcessing = true, BTDeviceStruct? btDevice}) {
+    debugPrint('transcript.dart resetState called');
+    audioBytesStream?.cancel();
     _memoryCreationTimer?.cancel();
 
     setState(() {
-      // whispersDiarized = [{}];
-      // customWebsocketTranscript = '';
-      if (resetBLEConnection) websocketReconnecting = true;
+      if (btDevice != null) this.btDevice = btDevice;
     });
-    if (resetBLEConnection) initBleConnection();
-  }
-
-  int _reconnectionAttempts = 0;
-
-  Future<void> _reconnectWebSocket() async {
-    if (_reconnectionAttempts >= 3) {
-      setState(() {
-        websocketReconnecting = false;
-      });
-      // TODO: reset here to 0? or not, this could cause infinite loop if it's called in parallel from 2 distinct places
-      debugPrint('Max reconnection attempts reached');
-      clearNotification(2);
-      createNotification(
-          notificationId: 2,
-          title: 'Deepgram Connection Error',
-          body: 'There was an error with the Deepgram connection, please restart the app and check your credentials.');
-      addEventToContext('Max reconnection attempts reached');
-      return;
+    if (restartBytesProcessing) initiateBytesProcessing();
+    if (restartBytesProcessing && segments.isNotEmpty && (segments.length > 1 || segments[0].text.isNotEmpty)) {
+      _initiateMemoryCreationTimer();
     }
-    setState(() {
-      websocketReconnecting = true;
-    });
-    _reconnectionAttempts++;
-    addEventToContext('Attempting to reconnect Websocket $_reconnectionAttempts');
-    await Future.delayed(const Duration(seconds: 3)); // Reconnect delay
-    debugPrint('Attempting to reconnect $_reconnectionAttempts time');
-    await initBleConnection();
   }
 
-  String _buildDiarizedTranscriptMessage() {
-    int totalSpeakers = whispersDiarized
-        .map((e) => e.keys.isEmpty ? 0 : ((e.keys).max + 1))
-        .reduce((value, element) => value > element ? value : element);
-
-    debugPrint('Speakers count: $totalSpeakers');
-
+  String _buildDiarizedTranscriptMessage(List<TranscriptSegment> segments) {
     String transcript = '';
-    for (int partIdx = 0; partIdx < whispersDiarized.length; partIdx++) {
-      var part = whispersDiarized[partIdx];
-      if (part.isEmpty) continue;
-      int totalSpeakers = part.keys.map((e) => e).reduce(max) + 1;
-      String transcriptItem = '';
-      for (int speaker = 0; speaker < totalSpeakers; speaker++) {
-        if (part.containsKey(speaker)) transcriptItem += 'Speaker $speaker: ${part[speaker]!} ';
+    for (var segment in segments) {
+      if (segment.isUser) {
+        transcript += 'You said: ${segment.text} ';
+      } else {
+        transcript += 'Speaker ${segment.speakerId}: ${segment.text} ';
       }
-      transcript += '$transcriptItem\n\n';
+      transcript += '\n\n';
     }
-    return transcript;
+    return transcript.trim();
   }
-
-  bool memoryCreating = false;
 
   _initiateConversationAdvisorTimer() {
     // TODO: improvements
@@ -281,11 +202,11 @@ class TranscriptWidgetState extends State<TranscriptWidget> with WidgetsBindingO
     // - Advice should have a tone, like a conversation purpose, chill with friends, networking, family, etc...
     _conversationAdvisorTimer = Timer.periodic(const Duration(seconds: 60 * 10), (timer) async {
       addEventToContext('Conversation Advisor Timer Triggered');
-      var transcript = _buildDiarizedTranscriptMessage();
+      var transcript = _buildDiarizedTranscriptMessage(segments);
       debugPrint('_initiateConversationAdvisorTimer: $transcript');
-      if (transcript.isEmpty || transcript.split(' ').length < 20) return;
       var advice = await adviseOnCurrentConversation(transcript);
       if (advice.isNotEmpty) {
+        MixpanelManager().coachAdvisorFeedback(transcript, advice);
         clearNotification(3);
         createNotification(notificationId: 3, title: 'Your Conversation Coach Says', body: advice);
       }
@@ -295,64 +216,22 @@ class TranscriptWidgetState extends State<TranscriptWidget> with WidgetsBindingO
   _initiateMemoryCreationTimer() {
     _memoryCreationTimer?.cancel();
     _memoryCreationTimer = Timer(const Duration(seconds: 120), () async {
-      widget.refreshMemories();
-      setState(() {
-        memoryCreating = true;
-      });
+      setState(() => memoryCreating = true);
       debugPrint('Creating memory from whispers');
-      String transcript = '';
-      if (customWebsocketTranscript.trim().isNotEmpty) {
-        transcript = customWebsocketTranscript.trim();
-      } else {
-        transcript = _buildDiarizedTranscriptMessage();
-      }
+      String transcript = _buildDiarizedTranscriptMessage(segments);
       debugPrint('Transcript: \n$transcript');
-      File file = await audioStorage!.createWavFile();
+      File file = await WavBytesUtil.createWavFile(audioStorage!.audioBytes);
       String? fileName = await uploadFile(file);
-      await processTranscriptContent(context, transcript, fileName);
+      await processTranscriptContent(context, transcript, fileName, file.path);
       await widget.refreshMemories();
-      addEventToContext('Memory Created');
-      setState(() {
-        whispersDiarized = [{}];
-        customWebsocketTranscript = '';
-        memoryCreating = false;
-      });
+      segments = [];
+      setState(() => memoryCreating = false);
       audioStorage?.clearAudioBytes();
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    if (wsConnectionState == WebsocketConnectionStatus.failed ||
-        wsConnectionState == WebsocketConnectionStatus.closed ||
-        wsConnectionState == WebsocketConnectionStatus.error) {
-      return _websocketConnectionIssueUI();
-    }
-
-    if (customWebsocketTranscript != '') {
-      return Row(
-        mainAxisAlignment: MainAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsetsDirectional.fromSTEB(16.0, 0.0, 16.0, 0.0),
-              child: Text(
-                customWebsocketTranscript,
-                style: FlutterFlowTheme.of(context).bodyMedium.override(
-                      fontFamily: FlutterFlowTheme.of(context).bodyMediumFamily,
-                      letterSpacing: 0.0,
-                      useGoogleFonts: GoogleFonts.asMap().containsKey(FlutterFlowTheme.of(context).bodyMediumFamily),
-                    ),
-              ),
-            ),
-          ),
-          // Expanded(child: _getDeepgramUI()),
-        ],
-      );
-    }
-
     if (memoryCreating) {
       return const Padding(
         padding: EdgeInsets.only(top: 48.0),
@@ -364,11 +243,33 @@ class TranscriptWidgetState extends State<TranscriptWidget> with WidgetsBindingO
       );
     }
 
-    if (whispersDiarized[0].keys.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.only(top: 48.0),
-        child: InfoButton(),
-      );
+    if (segments.isEmpty) {
+      return btDevice != null
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 16),
+                //
+                Image.asset(
+                  'assets/images/wave.gif',
+                  height: 200,
+                ),
+
+                const SizedBox(height: 32),
+                const Align(
+                  alignment: Alignment.center,
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 32.0),
+                    child: Text(
+                      textAlign: TextAlign.center,
+                      'Your transcripts will start appearing\nhere after 30 seconds.',
+                      style: TextStyle(color: Colors.white, height: 1.5),
+                    ),
+                  ),
+                )
+              ],
+            )
+          : const SizedBox.shrink();
     }
     return _getDeepgramTranscriptUI();
   }
@@ -378,74 +279,39 @@ class TranscriptWidgetState extends State<TranscriptWidget> with WidgetsBindingO
       padding: EdgeInsets.zero,
       shrinkWrap: true,
       scrollDirection: Axis.vertical,
-      itemCount: whispersDiarized.length,
+      itemCount: segments.length + 1,
       physics: const NeverScrollableScrollPhysics(),
       separatorBuilder: (_, __) => const SizedBox(height: 16.0),
       itemBuilder: (context, idx) {
-        final data = whispersDiarized[idx];
-        var keys = data.keys.map((e) => e);
-        int totalSpeakers = keys.isNotEmpty ? (keys.reduce(max) + 1) : 0;
+        if (idx == 0) {
+          return Padding(
+            padding: const EdgeInsets.only(top: 8.0, bottom: 32),
+            child: Align(
+              alignment: Alignment.center,
+              child:                 Image.asset(
+                  'assets/images/wave.gif',
+                  width: 200,
+                ),
+            ),
+          );
+        }
+        final data = segments[idx - 1];
         String transcriptItem = '';
-        for (int speaker = 0; speaker < totalSpeakers; speaker++) {
-          if (data.containsKey(speaker)) {
-            transcriptItem += 'Speaker $speaker: ${data[speaker]!} ';
-          }
+        if (data.isUser) {
+          transcriptItem = 'You said: ${data.text}';
+        } else {
+          transcriptItem = 'Speaker ${data.speakerId}: ${data.text}';
         }
         return Padding(
           padding: const EdgeInsetsDirectional.fromSTEB(16.0, 0.0, 16.0, 0.0),
-          child: Text(
-            transcriptItem,
-            style: FlutterFlowTheme.of(context).bodyMedium.override(
-                  fontFamily: FlutterFlowTheme.of(context).bodyMediumFamily,
-                  letterSpacing: 0.0,
-                  useGoogleFonts: GoogleFonts.asMap().containsKey(FlutterFlowTheme.of(context).bodyMediumFamily),
-                ),
+          child: SelectionArea(
+            child: Text(
+              transcriptItem,
+              style: const TextStyle(letterSpacing: 0.0, color: Colors.white),
+            ),
           ),
         );
       },
-    );
-  }
-
-  _websocketConnectionIssueUI() {
-    return Column(
-      children: [
-        Text(
-          wsConnectionState == WebsocketConnectionStatus.failed
-              ? '🚨 Deepgram connection failed'
-              : (wsConnectionState == WebsocketConnectionStatus.closed)
-                  ? 'Deepgram connection closed'
-                  : wsConnectionState == WebsocketConnectionStatus.error
-                      ? 'Deepgram connection error'
-                      : 'Deepgram connection failed',
-          style: const TextStyle(color: Colors.white, fontSize: 16),
-        ),
-        SizedBox(height: websocketReconnecting ? 20 : 12),
-        websocketReconnecting
-            ? CircularProgressIndicator(
-                color: FlutterFlowTheme.of(context).primary,
-              )
-            : TextButton(
-                onPressed: () {
-                  if (websocketReconnecting) return;
-                  addEventToContext('Retry Websocket Connection Clicked');
-                  resetState();
-                },
-                style: ButtonStyle(
-                  shape: MaterialStateProperty.all<RoundedRectangleBorder>(
-                    RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12.0),
-                      side: const BorderSide(color: Colors.white, width: 0.2),
-                    ),
-                  ),
-                ),
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16.0),
-                  child: Text(
-                    'Retry',
-                    style: TextStyle(color: Colors.white, fontSize: 18),
-                  ),
-                )),
-      ],
     );
   }
 }

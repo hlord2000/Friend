@@ -1,141 +1,103 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:friend_private/backend/api_requests/cloud_storage.dart';
-import 'package:friend_private/utils/ble/communication.dart';
-import 'package:friend_private/utils/ble/connected.dart';
-import 'package:friend_private/utils/ble/scan.dart';
-import 'package:friend_private/utils/notifications.dart';
-import 'package:friend_private/widgets/blur_bot_widget.dart';
+import 'package:friend_private/backend/schema/bt_device.dart';
+
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:friend_private/widgets/scanning_animation.dart';
 import 'package:friend_private/widgets/scanning_ui.dart';
-import 'package:google_fonts/google_fonts.dart';
-import '/backend/schema/structs/index.dart';
-import '/flutter_flow/flutter_flow_theme.dart';
 import 'widgets/transcript.dart';
+import 'package:friend_private/backend/storage/memories.dart';
+import 'package:intl/intl.dart';
+import 'package:friend_private/backend/api_requests/api_calls.dart';
 
-class HomePage extends StatefulWidget {
+class DevicePage extends StatefulWidget {
   final Function refreshMemories;
-  final dynamic btDevice;
+  final BTDeviceStruct? device;
+
+  // final int batteryLevel;
   final GlobalKey<TranscriptWidgetState> transcriptChildWidgetKey;
 
-  const HomePage({
+  const DevicePage({
     super.key,
-    required this.btDevice,
+    required this.device,
     required this.refreshMemories,
     required this.transcriptChildWidgetKey,
   });
 
   @override
-  State<HomePage> createState() => _HomePageState();
+  State<DevicePage> createState() => _DevicePageState();
 }
 
-class _HomePageState extends State<HomePage> {
-  BTDeviceStruct? _device;
+class _DevicePageState extends State<DevicePage> with AutomaticKeepAliveClientMixin {
+  bool _isLoading = true;
 
-  final scaffoldKey = GlobalKey<ScaffoldState>();
-  final unFocusNode = FocusNode();
-
-  StreamSubscription<BluetoothConnectionState>? connectionStateListener;
-  StreamSubscription? bleBatteryLevelListener;
-  int batteryLevel = -1;
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void initState() {
     super.initState();
-    if (widget.btDevice != null) {
-      _device = BTDeviceStruct.maybeFromMap(widget.btDevice);
-      _initiateConnectionListener();
-      _initiateBleBatteryListener();
-    } else {
-      scanAndConnectDevice().then((friendDevice) {
-        if (friendDevice != null) {
-          setState(() {
-            _device = friendDevice;
-          });
-          _initiateConnectionListener();
-          _initiateBleBatteryListener();
-        }
-      });
+    _checkMemorySchemaUpdated();
+  }
+
+  Future<void> _checkMemorySchemaUpdated() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    bool isMemorySchemaUpdated = prefs.getBool('isMemorySchemaUpdated') ?? false;
+
+    if (!isMemorySchemaUpdated) {
+      debugPrint("Updating Memory Schema in Pinecone");
+      await updateCreatedAtToEpoch();
+      await prefs.setBool('isMemorySchemaUpdated', true);
     }
-    authenticateGCP();
-  }
 
-  _initiateBleBatteryListener() async {
-    if (bleBatteryLevelListener != null) return;
-    bleBatteryLevelListener = await getBleBatteryLevelListener(_device!, onBatteryLevelChange: (int value) {
-      setState(() {
-        batteryLevel = value;
-      });
+    setState(() {
+      _isLoading = false;
     });
   }
 
-  _initiateConnectionListener() async {
-    connectionStateListener = getConnectionStateListener(_device!.id, () {
-      // when bluetooth disconnected we don't want to reset the BLE connection as there's no point, no device connected
-      // we don't want either way to trigger the websocket closed event, because it's closed on purpose
-      // and we don't want to retry the websocket connection or something
-      widget.transcriptChildWidgetKey.currentState?.resetState(resetBLEConnection: false);
-      setState(() {
-        _device = null;
-      });
-      bleBatteryLevelListener?.cancel();
-      bleBatteryLevelListener = null;
-      // Sentry.captureMessage('Friend Device Disconnected', level: SentryLevel.warning);
-      createNotification(title: 'Friend Device Disconnected', body: 'Please reconnect to continue using your Friend.');
-      scanAndConnectDevice().then((friendDevice) {
-        if (friendDevice != null) {
-          setState(() {
-            _device = friendDevice;
-          });
-          clearNotification(1);
-          _initiateBleBatteryListener();
-        }
-      });
-    }, () {
-      widget.transcriptChildWidgetKey.currentState?.resetState(resetBLEConnection: true);
-    });
-  }
+  Future<void> updateCreatedAtToEpoch() async {
+    List<MemoryRecord> memoryRecords = await MemoryStorage.getAllMemories();
+    DateFormat dateFormat = DateFormat("yyyy-MM-dd HH:mm:ss.SSSSSS");
 
-  @override
-  void dispose() {
-    unFocusNode.dispose();
-    connectionStateListener?.cancel();
-    bleBatteryLevelListener?.cancel();
-    super.dispose();
+    for (MemoryRecord memoryRecord in memoryRecords) {
+      DateTime dateTime = dateFormat.parse(memoryRecord.createdAt.toString());
+      int timestamp = dateTime.millisecondsSinceEpoch ~/ 1000;
+      updateCreatedAtInPinecone(memoryRecord.id, timestamp);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: () => unFocusNode.canRequestFocus
-          ? FocusScope.of(context).requestFocus(unFocusNode)
-          : FocusScope.of(context).unfocus(),
-      child: Scaffold(
-        key: scaffoldKey,
-        backgroundColor: FlutterFlowTheme.of(context).primary,
-        body: Stack(
-          children: [
-            const BlurBotWidget(),
-            ListView(children: [
-              ..._getConnectedDeviceWidgets(),
-              _device != null
-                  ? TranscriptWidget(
-                      btDevice: _device!,
-                      key: widget.transcriptChildWidgetKey,
-                      refreshMemories: widget.refreshMemories,
-                    )
-                  : const SizedBox.shrink(),
-            ]),
-          ],
-        ),
-      ),
-    );
+    return _isLoading
+        ? const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text(
+                  'Updating Memory Schema, do not close',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          )
+        : ListView(children: [
+            ..._getConnectedDeviceWidgets(),
+            TranscriptWidget(
+              btDevice: widget.device,
+              key: widget.transcriptChildWidgetKey,
+              refreshMemories: widget.refreshMemories,
+            ),
+            const SizedBox(height: 16)
+          ]);
   }
 
   _getConnectedDeviceWidgets() {
-    if (_device == null) {
+    if (widget.device == null) {
       return [
         const SizedBox(height: 64),
         const ScanningAnimation(),
@@ -152,18 +114,16 @@ class _HomePageState extends State<HomePage> {
         sizeMultiplier: 0.4,
       )),
       const SizedBox(height: 16),
-      Center(
+      const Center(
           child: Text(
         'Connected Device',
-        style: FlutterFlowTheme.of(context).bodyMedium.override(
-              fontFamily: 'SF Pro Display',
-              color: Colors.white,
-              fontSize: 29.0,
-              letterSpacing: 0.0,
-              fontWeight: FontWeight.w700,
-              useGoogleFonts: GoogleFonts.asMap().containsKey('SF Pro Display'),
-              lineHeight: 1.2,
-            ),
+        style: TextStyle(
+            fontFamily: 'SF Pro Display',
+            color: Colors.white,
+            fontSize: 29.0,
+            letterSpacing: 0.0,
+            fontWeight: FontWeight.w700,
+            height: 1.2),
         textAlign: TextAlign.center,
       )),
       const SizedBox(height: 8),
@@ -172,7 +132,7 @@ class _HomePageState extends State<HomePage> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Text(
-            '${_device?.name ?? 'Friend'} ~ ${_device?.id.split('-').last.substring(0, 6)}',
+            '${widget.device?.name ?? 'Friend'} ~ ${widget.device?.id.split('-').last.substring(0, 6)}',
             style: const TextStyle(
               color: Color.fromARGB(255, 255, 255, 255),
               fontSize: 16.0,
@@ -181,49 +141,8 @@ class _HomePageState extends State<HomePage> {
             ),
             textAlign: TextAlign.center,
           ),
-          batteryLevel == -1 ? const SizedBox.shrink() : const SizedBox(width: 16.0),
-          batteryLevel == -1
-              ? const SizedBox.shrink()
-              : Container(
-                  decoration: BoxDecoration(
-                    color: Colors.transparent,
-                    borderRadius: BorderRadius.circular(30),
-                    border: Border.all(
-                      color: Colors.white,
-                      width: 1,
-                    ),
-                  ),
-                  padding: const EdgeInsets.all(8.0),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        '${batteryLevel.toString()}%',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(width: 8.0),
-                      Container(
-                        width: 10,
-                        height: 10,
-                        decoration: BoxDecoration(
-                          color: batteryLevel > 75
-                              ? const Color.fromARGB(255, 0, 255, 8)
-                              : batteryLevel > 20
-                                  ? Colors.yellow.shade700
-                                  : Colors.red,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
         ],
       ),
-      const SizedBox(height: 64),
     ];
   }
 }
